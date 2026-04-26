@@ -31,6 +31,12 @@ from wheel_control import DiffDrive, LEFT_ID, RIGHT_ID, keyboard_loop
 
 DEFAULT_CONFIG = Path(__file__).resolve().parent / "xoq_config.json"
 
+# Default wheels iroh ID — points at the public xlerobot demo base. If you run
+# your own xoq_servers.py the generated xoq_config.json takes precedence, and
+# --id always wins. iroh identities are persistent (see xoq_servers.py
+# --key-root), so this only needs updating if the base is rebuilt.
+DEFAULT_WHEELS_ID = "9487f3e866e131f4010cc42c5c554f1dbf14379fbf77cb583fbe472509506403"
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
@@ -49,12 +55,8 @@ def main():
 
     if args.id:
         wheels_id = args.id
-    else:
-        if not args.config.exists():
-            print(f"error: config not found: {args.config}\n"
-                  f"  run xoq_servers.py first, or pass --id <hex>",
-                  file=sys.stderr)
-            return 2
+        source = "--id"
+    elif args.config.exists():
         cfg = json.loads(args.config.read_text())
         try:
             wheels_id = cfg["servers"]["wheels"]["id"]
@@ -62,10 +64,16 @@ def main():
             print(f"error: config has no 'wheels' server entry: {args.config}",
                   file=sys.stderr)
             return 2
+        source = str(args.config)
+    else:
+        wheels_id = DEFAULT_WHEELS_ID
+        source = "built-in default"
 
     if wheels_id is None or len(wheels_id) != 64:
         print(f"error: invalid wheels iroh ID: {wheels_id!r}", file=sys.stderr)
         return 2
+
+    print(f"wheels ID source: {source}")
 
     print(f"Connecting to wheels server  {wheels_id[:16]}…")
     ser = xoq.serial.Serial(wheels_id, timeout=0.05)
