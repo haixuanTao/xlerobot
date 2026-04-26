@@ -27,13 +27,99 @@ DEFAULT_CONFIG_OUT = Path(__file__).resolve().parent / "xoq_config.json"
 
 ID_RE = re.compile(r"\bID:\s*([0-9a-f]{64})\b")
 
-DEFAULT_PORTS = {
-    "left-arm":  "/dev/tty.usbmodem-ARM-L",
-    "right-arm": "/dev/tty.usbmodem-ARM-R",
-    "wheels":    "/dev/tty.usbmodem-WHEELS",
-}
+SLOTS = ("left-arm", "right-arm", "wheels")
+LABEL_WIDTH = max(len(name) for name in SLOTS) + 1
 
-LABEL_WIDTH = max(len(name) for name in DEFAULT_PORTS) + 1
+# Feetech protocol bits — used by the autodetect probe.
+WHEEL_IDS = (7, 8)              # both must respond → port is the wheels bus
+ARM_PROBE_ID = 1                # SO-100 always has ID 1 → port is an arm
+PROBE_TIMEOUT_S = 0.05
+
+try:
+    import serial as _pyserial
+except ImportError:
+    _pyserial = None
+
+
+def _ping(ser, motor_id, timeout=PROBE_TIMEOUT_S):
+    """Send a Feetech PING; return True if the servo responds."""
+    body = [motor_id, 0x02, 0x01]  # id, length, INST_PING
+    chk = (~sum(body)) & 0xFF
+    ser.reset_input_buffer()
+    ser.write(bytes([0xFF, 0xFF, *body, chk]))
+    ser.flush()
+    deadline = time.monotonic() + timeout
+    buf = bytearray()
+    while time.monotonic() < deadline and len(buf) < 6:
+        chunk = ser.read(6 - len(buf))
+        if chunk:
+            buf.extend(chunk)
+    return (len(buf) >= 6 and buf[0] == 0xFF and buf[1] == 0xFF
+            and buf[2] == motor_id)
+
+
+def _probe(path, baud):
+    """Return the set of probe IDs that responded on this port (empty on error)."""
+    try:
+        ser = _pyserial.Serial(path, baudrate=baud, timeout=PROBE_TIMEOUT_S)
+    except Exception as e:
+        print(f"  {path}: open failed ({e})", flush=True)
+        return set()
+    try:
+        return {sid for sid in (ARM_PROBE_ID, *WHEEL_IDS) if _ping(ser, sid)}
+    finally:
+        ser.close()
+
+
+def autodetect(missing_slots, exclude_paths, baud):
+    """Probe candidate ports and assign them to the slots in `missing_slots`.
+
+    Returns (assignments_dict, error_message). On failure assignments is None.
+    """
+    if _pyserial is None:
+        return None, "pyserial not installed — cannot autodetect; pass --*-port flags"
+
+    candidates = sorted(set(glob.glob("/dev/tty.usbmodem*") + glob.glob("/dev/ttyUSB*"))
+                        - set(exclude_paths))
+    if not candidates:
+        return None, "no /dev/tty.usbmodem* or /dev/ttyUSB* candidates to probe"
+
+    print(f"[autodetect] probing {len(candidates)} port(s) at {baud} baud "
+          f"(IDs {ARM_PROBE_ID}, {WHEEL_IDS[0]}, {WHEEL_IDS[1]})...", flush=True)
+
+    by_path = {}
+    for path in candidates:
+        ids = _probe(path, baud)
+        kind = ("wheels" if set(WHEEL_IDS).issubset(ids)
+                else "arm" if ARM_PROBE_ID in ids
+                else "unknown")
+        print(f"  {path}: responding={sorted(ids) or '∅'} → {kind}", flush=True)
+        by_path[path] = ids
+
+    wheels_paths = [p for p, ids in by_path.items() if set(WHEEL_IDS).issubset(ids)]
+    arm_paths = sorted(p for p, ids in by_path.items()
+                       if ARM_PROBE_ID in ids and not set(WHEEL_IDS).issubset(ids))
+
+    assignments = {}
+
+    if "wheels" in missing_slots:
+        if len(wheels_paths) == 0:
+            return None, ("no wheels bus detected (no port responded to both "
+                          f"ID {WHEEL_IDS[0]} and ID {WHEEL_IDS[1]})")
+        if len(wheels_paths) > 1:
+            return None, f"ambiguous: multiple wheels buses {wheels_paths}"
+        assignments["wheels"] = wheels_paths[0]
+
+    arm_slots_needed = [s for s in ("left-arm", "right-arm") if s in missing_slots]
+    if arm_slots_needed:
+        if len(arm_paths) < len(arm_slots_needed):
+            return None, (f"need {len(arm_slots_needed)} arm bus(es), "
+                          f"found {len(arm_paths)}: {arm_paths}")
+        # Stable but arbitrary: lowest path → left, next → right.
+        for slot, path in zip(arm_slots_needed, arm_paths):
+            assignments[slot] = path
+
+    return assignments, None
 
 
 @dataclass
@@ -136,9 +222,13 @@ def shutdown(servers: list[Server]) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--left-arm-port",  default=DEFAULT_PORTS["left-arm"])
-    parser.add_argument("--right-arm-port", default=DEFAULT_PORTS["right-arm"])
-    parser.add_argument("--wheels-port",    default=DEFAULT_PORTS["wheels"])
+    parser.add_argument("--left-arm-port",  default=None,
+                        help="Skip autodetect; pin left arm to this /dev/tty path")
+    parser.add_argument("--right-arm-port", default=None,
+                        help="Skip autodetect; pin right arm to this /dev/tty path")
+    parser.add_argument("--wheels-port",    default=None,
+                        help=f"Skip autodetect; pin wheels (IDs {WHEEL_IDS[0]}+{WHEEL_IDS[1]}) "
+                             f"to this /dev/tty path")
     parser.add_argument("--baud", type=int, default=DEFAULT_BAUD)
     parser.add_argument("--key-root", type=Path, default=DEFAULT_KEY_ROOT)
     parser.add_argument("--wser-dir", type=Path, default=DEFAULT_WSER_DIR)
@@ -155,39 +245,45 @@ def main() -> int:
         print("error: `cargo` not on PATH", file=sys.stderr)
         return 2
 
-    requested = {
+    pinned = {
         "left-arm":  args.left_arm_port,
         "right-arm": args.right_arm_port,
         "wheels":    args.wheels_port,
     }
-    missing = {name: p for name, p in requested.items() if not os.path.exists(p)}
-    if missing:
+    missing_slots = [s for s, p in pinned.items() if p is None]
+    if missing_slots:
+        assignments, err = autodetect(
+            missing_slots=missing_slots,
+            exclude_paths=[p for p in pinned.values() if p],
+            baud=args.baud,
+        )
+        if err:
+            print(f"error: autodetect failed: {err}", file=sys.stderr)
+            available = sorted(glob.glob("/dev/tty.usbmodem*") + glob.glob("/dev/ttyUSB*"))
+            if available:
+                print("\nAvailable ports right now:", file=sys.stderr)
+                for p in available:
+                    print(f"  {p}", file=sys.stderr)
+                print("\nPin them manually with --left-arm-port / --right-arm-port / "
+                      "--wheels-port and re-run.", file=sys.stderr)
+            return 2
+        for slot, path in assignments.items():
+            pinned[slot] = path
+        print("[autodetect] assigned:", flush=True)
+        for slot in SLOTS:
+            print(f"  {slot:<{LABEL_WIDTH}} {pinned[slot]}"
+                  f"{'  (pinned)' if slot not in assignments else ''}", flush=True)
+
+    not_present = {s: p for s, p in pinned.items() if not os.path.exists(p)}
+    if not_present:
         print("error: the following serial ports do not exist:", file=sys.stderr)
-        for name, p in missing.items():
-            print(f"  {name}: {p}", file=sys.stderr)
-        available = sorted(glob.glob("/dev/tty.usbmodem*") + glob.glob("/dev/ttyUSB*"))
-        if available:
-            print("\nAvailable usbmodem/ttyUSB ports right now:", file=sys.stderr)
-            for p in available:
-                print(f"  {p}", file=sys.stderr)
-            print("\nRe-run with explicit flags, e.g.:", file=sys.stderr)
-            print(f"  python {Path(sys.argv[0]).name} \\\n"
-                  f"    --left-arm-port  {available[0] if len(available) > 0 else '<port>'} \\\n"
-                  f"    --right-arm-port {available[1] if len(available) > 1 else '<port>'} \\\n"
-                  f"    --wheels-port    {available[2] if len(available) > 2 else '<port>'}",
-                  file=sys.stderr)
-        else:
-            print("\nNo /dev/tty.usbmodem* or /dev/ttyUSB* devices detected. "
-                  "Plug in the Feetech adapters first.", file=sys.stderr)
+        for s, p in not_present.items():
+            print(f"  {s}: {p}", file=sys.stderr)
         return 2
 
     binary = build_binary(args.wser_dir)
 
-    plan = [
-        ("left-arm",  args.left_arm_port),
-        ("right-arm", args.right_arm_port),
-        ("wheels",    args.wheels_port),
-    ]
+    plan = [(slot, pinned[slot]) for slot in SLOTS]
 
     servers: list[Server] = []
     for name, port in plan:

@@ -43,11 +43,13 @@ WSER_PY=/path/to/wser/.venv/bin/python
 ## Robot side — start the servers
 
 ```
-$WSER_PY xoq_servers.py \
-  --left-arm-port  /dev/tty.usbmodem-ARM-L \
-  --right-arm-port /dev/tty.usbmodem-ARM-R \
-  --wheels-port    /dev/tty.usbmodem-WHEELS
+$WSER_PY xoq_servers.py
 ```
+
+By default it auto-detects which `/dev/tty.usbmodem*` is which: a port whose
+servos respond to Feetech IDs **7 and 8** is the wheels bus, ports responding
+to ID **1** are arms (lowest path → left). Override any slot by passing
+`--left-arm-port`, `--right-arm-port`, or `--wheels-port`.
 
 First run builds `serial-server --features "iroh serial"` (~30s). After all 3
 buses log a `Server ID:` line, the script writes `xoq_config.json` next to
