@@ -22,6 +22,21 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+# Install the xoq_serial hook BEFORE `import serial`, so 64-hex iroh IDs
+# route over the network instead of being treated as /dev paths.
+try:
+    from xoq_serial import _serial_hook as _xoq_hook
+    _xoq_hook.install()
+except ImportError:
+    print(
+        "error: this script needs `xoq_serial` to route remote serial ports.\n"
+        "  fix: run with the wser venv that already has it:\n"
+        f"    /Users/xaviertao/Documents/work/wser/.venv/bin/python {sys.argv[0]}\n"
+        "  or install it: pip install -e /Users/xaviertao/Documents/work/wser/packages/serial",
+        file=sys.stderr,
+    )
+    sys.exit(2)
+
 import serial  # patched by xoq_serial: 64-hex IDs route over iroh
 
 # --- Feetech STS3215 (protocol v1) ---------------------------------------
