@@ -90,33 +90,61 @@ def autodetect(missing_slots, exclude_paths, baud):
     by_path = {}
     for path in candidates:
         ids = _probe(path, baud)
-        kind = ("wheels" if set(WHEEL_IDS).issubset(ids)
-                else "arm" if ARM_PROBE_ID in ids
-                else "unknown")
+        has_wheels = set(WHEEL_IDS).issubset(ids)
+        has_arm = ARM_PROBE_ID in ids
+        if has_arm and has_wheels:
+            kind = "arm+wheels (combined)"
+        elif has_wheels:
+            kind = "wheels"
+        elif has_arm:
+            kind = "arm"
+        else:
+            kind = "unknown"
         print(f"  {path}: responding={sorted(ids) or '∅'} → {kind}", flush=True)
         by_path[path] = ids
 
-    wheels_paths = [p for p, ids in by_path.items() if set(WHEEL_IDS).issubset(ids)]
-    arm_paths = sorted(p for p, ids in by_path.items()
-                       if ARM_PROBE_ID in ids and not set(WHEEL_IDS).issubset(ids))
+    combined_paths = sorted(p for p, ids in by_path.items()
+                            if ARM_PROBE_ID in ids and set(WHEEL_IDS).issubset(ids))
+    wheels_only_paths = [p for p, ids in by_path.items()
+                         if set(WHEEL_IDS).issubset(ids) and ARM_PROBE_ID not in ids]
+    arm_only_paths = sorted(p for p, ids in by_path.items()
+                            if ARM_PROBE_ID in ids
+                            and not set(WHEEL_IDS).issubset(ids))
 
     assignments = {}
 
+    if combined_paths:
+        # Combined Waveshare: arm + wheels share a single bus. The combined port
+        # takes the left-arm slot and wheels.id will alias to it in the config.
+        if len(combined_paths) > 1:
+            return None, f"ambiguous: multiple arm+wheels buses {combined_paths}"
+        combined = combined_paths[0]
+        if "left-arm" in missing_slots:
+            assignments["left-arm"] = combined
+        if "wheels" in missing_slots:
+            assignments["wheels"] = combined  # alias: same bus as left-arm
+        if "right-arm" in missing_slots:
+            if not arm_only_paths:
+                return None, ("combined bus assigned to left-arm, but no second "
+                              "arm-only bus found for right-arm")
+            assignments["right-arm"] = arm_only_paths[0]
+        return assignments, None
+
+    # Legacy 3-bus layout: wheels on its own, plus 2 arm-only buses.
     if "wheels" in missing_slots:
-        if len(wheels_paths) == 0:
+        if len(wheels_only_paths) == 0:
             return None, ("no wheels bus detected (no port responded to both "
                           f"ID {WHEEL_IDS[0]} and ID {WHEEL_IDS[1]})")
-        if len(wheels_paths) > 1:
-            return None, f"ambiguous: multiple wheels buses {wheels_paths}"
-        assignments["wheels"] = wheels_paths[0]
+        if len(wheels_only_paths) > 1:
+            return None, f"ambiguous: multiple wheels-only buses {wheels_only_paths}"
+        assignments["wheels"] = wheels_only_paths[0]
 
     arm_slots_needed = [s for s in ("left-arm", "right-arm") if s in missing_slots]
     if arm_slots_needed:
-        if len(arm_paths) < len(arm_slots_needed):
+        if len(arm_only_paths) < len(arm_slots_needed):
             return None, (f"need {len(arm_slots_needed)} arm bus(es), "
-                          f"found {len(arm_paths)}: {arm_paths}")
-        # Stable but arbitrary: lowest path → left, next → right.
-        for slot, path in zip(arm_slots_needed, arm_paths):
+                          f"found {len(arm_only_paths)}: {arm_only_paths}")
+        for slot, path in zip(arm_slots_needed, arm_only_paths):
             assignments[slot] = path
 
     return assignments, None
@@ -283,22 +311,39 @@ def main() -> int:
 
     binary = build_binary(args.wser_dir)
 
-    plan = [(slot, pinned[slot]) for slot in SLOTS]
+    # Group slots by port: when arm + wheels share one Waveshare we still want
+    # only ONE serial-server holding that /dev/tty.* (since OS exclusivity).
+    # The owner slot drives the iroh identity; aliased slots reuse its ID.
+    SLOT_PRIORITY = ("left-arm", "right-arm", "wheels")  # owner > alias
+    by_port: dict[str, str] = {}                         # port -> owner slot
+    aliases: dict[str, str] = {}                         # alias slot -> owner slot
+    for slot in SLOT_PRIORITY:
+        port = pinned[slot]
+        if port in by_port:
+            aliases[slot] = by_port[port]
+        else:
+            by_port[port] = slot
+
+    if aliases:
+        print("[layout] combined bus detected:", flush=True)
+        for alias, owner in aliases.items():
+            print(f"  {alias:<{LABEL_WIDTH}} aliased to '{owner}' (same bus: {pinned[alias]})",
+                  flush=True)
 
     servers: list[Server] = []
-    for name, port in plan:
-        moq_path = f"anon/xlerobot-{name}" if args.moq_relay else None
+    for port, owner_slot in by_port.items():
+        moq_path = f"anon/xlerobot-{owner_slot}" if args.moq_relay else None
         proc = spawn_server(
-            name=name,
+            name=owner_slot,
             port=port,
             baud=args.baud,
-            key_dir=args.key_root / name,
+            key_dir=args.key_root / owner_slot,
             binary=binary,
             wser_dir=args.wser_dir,
             moq_relay=args.moq_relay,
         )
         servers.append(Server(
-            name=name,
+            name=owner_slot,
             port=port,
             baud=args.baud,
             moq_relay=args.moq_relay,
@@ -315,19 +360,22 @@ def main() -> int:
     summary_printed = False
 
     def write_config():
-        config = {
-            "version": 1,
-            "servers": {
-                s.name: {
-                    "id": s.server_id,
-                    "port": s.port,
-                    "baud": s.baud,
-                    "moq_relay": s.moq_relay,
-                    "moq_path": s.moq_path,
-                }
-                for s in servers
-            },
-        }
+        owners = {s.name: s for s in servers}
+        entries = {}
+        for slot in SLOTS:
+            owner_slot = aliases.get(slot, slot)
+            owner = owners[owner_slot]
+            entry = {
+                "id": owner.server_id,
+                "port": pinned[slot],
+                "baud": owner.baud,
+                "moq_relay": owner.moq_relay,
+                "moq_path": owner.moq_path,
+            }
+            if slot in aliases:
+                entry["alias_of"] = owner_slot
+            entries[slot] = entry
+        config = {"version": 1, "servers": entries}
         args.config_out.parent.mkdir(parents=True, exist_ok=True)
         tmp = args.config_out.with_suffix(args.config_out.suffix + ".tmp")
         tmp.write_text(json.dumps(config, indent=2) + "\n")
@@ -339,9 +387,12 @@ def main() -> int:
             return
         if all(s.server_id for s in servers):
             write_config()
+            owners = {s.name: s for s in servers}
             print("\n=== XoQ server IDs ===", flush=True)
-            for s in servers:
-                print(f"{s.name:<{LABEL_WIDTH}} : {s.server_id}", flush=True)
+            for slot in SLOTS:
+                owner = owners[aliases.get(slot, slot)]
+                tag = f" (→ {aliases[slot]})" if slot in aliases else ""
+                print(f"{slot:<{LABEL_WIDTH}} : {owner.server_id}{tag}", flush=True)
             print(f"\nconfig written: {args.config_out}", flush=True)
             print("======================\n", flush=True)
             summary_printed = True

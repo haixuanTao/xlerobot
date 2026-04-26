@@ -19,7 +19,7 @@ import signal
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import serial as pyserial  # only for local /dev/tty.* leader arms
@@ -41,20 +41,28 @@ INST_WRITE = 0x03
 INST_SYNC_WRITE = 0x83
 
 ADDR_TORQUE_ENABLE = 40        # 1 byte
-ADDR_GOAL_POSITION = 42        # 2 bytes
+ADDR_GOAL_POSITION = 42        # 2 bytes (arms)
+ADDR_GOAL_SPEED = 46           # 2 bytes (wheels, signed via bit 15)
+ADDR_TORQUE_LIMIT = 48         # 2 bytes RAM, 0-1000
 ADDR_PRESENT_POSITION = 56     # 2 bytes
 
 DEFAULT_SERVO_IDS = [1, 2, 3, 4, 5, 6]
 DEFAULT_BAUD = 1_000_000
 DEFAULT_CONFIG = Path(__file__).resolve().parent / "xoq_config.json"
 
-# Default follower iroh IDs — point at the public xlerobot demo arms. If you
-# run your own xoq_servers.py the generated xoq_config.json takes precedence,
-# and --left-arm-id / --right-arm-id always win.
+# Default follower iroh IDs — point at the public xlerobot demo arms.
 DEFAULT_FOLLOWER_IDS = {
     "left-arm":  "bbe73cf93555520472aeb48ebe62677099887e9b64ef53590740d0c78e7c5060",
     "right-arm": "02d5f49e541f0777eca479d240babf8d0f9f33b81d49c13d7c3a77a06af2afad",
 }
+DEFAULT_WHEELS_ID = "bbe73cf93555520472aeb48ebe62677099887e9b64ef53590740d0c78e7c5060"
+
+# Wheels: STS3215 on the same Feetech bus as the left arm (combined Waveshare).
+WHEEL_LEFT_ID = 7
+WHEEL_RIGHT_ID = 8
+WHEEL_SPEED_LIMIT = 1023
+WHEEL_INVERT_RIGHT = True
+WHEEL_TORQUE_LIMIT = 700
 
 
 def _checksum(body):
@@ -136,6 +144,94 @@ class FeetechBus:
         if items:
             self.ser.write(_sync_write_packet(ADDR_GOAL_POSITION, 2, items))
 
+    def write_byte_register(self, motor_id, addr, data):
+        """Public wrapper around _write_inst for callers that need a single
+        register write (e.g. wheel torque-limit setup)."""
+        self._write_inst(motor_id, addr, data)
+
+
+# ---- Wheels --------------------------------------------------------------
+
+@dataclass
+class WheelState:
+    v: int = 0
+    w: int = 0
+    step: int = 250
+    max_speed: int = WHEEL_SPEED_LIMIT
+    lock: "threading.Lock" = field(default_factory=threading.Lock)
+
+    def snapshot(self):
+        with self.lock:
+            return self.v, self.w, self.step
+
+
+def _pack_wheel_speed(signed):
+    speed = max(-WHEEL_SPEED_LIMIT, min(WHEEL_SPEED_LIMIT, int(signed)))
+    raw = (-speed) | 0x8000 if speed < 0 else speed
+    return [raw & 0xFF, (raw >> 8) & 0xFF]
+
+
+def write_wheel_speeds(bus, v, w):
+    """Diff drive (v=forward, w=turn-left). Single sync_write to IDs 7+8."""
+    left = v - w
+    right = v + w
+    if WHEEL_INVERT_RIGHT:
+        right = -right
+    items = [
+        (WHEEL_LEFT_ID,  _pack_wheel_speed(left)),
+        (WHEEL_RIGHT_ID, _pack_wheel_speed(right)),
+    ]
+    bus.ser.write(_sync_write_packet(ADDR_GOAL_SPEED, 2, items))
+
+
+def configure_wheels(bus, torque_limit=WHEEL_TORQUE_LIMIT):
+    """Set RAM Torque Limit, zero goal_speed, then enable torque."""
+    for sid in (WHEEL_LEFT_ID, WHEEL_RIGHT_ID):
+        bus.write_byte_register(sid, ADDR_TORQUE_LIMIT,
+                                [torque_limit & 0xFF, (torque_limit >> 8) & 0xFF])
+    write_wheel_speeds(bus, 0, 0)
+    bus.set_torque((WHEEL_LEFT_ID, WHEEL_RIGHT_ID), True)
+
+
+def keyboard_thread(state, stop):
+    import select
+    import termios
+    import tty
+
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setcbreak(fd)
+        print("\n[wheels] w/s = forward/reverse | a/d = turn left/right | "
+              "space = stop | [/] = step | q = quit", flush=True)
+        while not stop.is_set():
+            ready, _, _ = select.select([sys.stdin], [], [], 0.1)
+            if not ready:
+                continue
+            c = sys.stdin.read(1)
+            with state.lock:
+                if c == 'q':
+                    state.v = state.w = 0
+                    stop.set()
+                elif c == 'w':
+                    state.v = max(-state.max_speed, min(state.max_speed, state.v + state.step))
+                elif c == 's':
+                    state.v = max(-state.max_speed, min(state.max_speed, state.v - state.step))
+                elif c == 'a':
+                    state.w = max(-state.max_speed, min(state.max_speed, state.w + state.step))
+                elif c == 'd':
+                    state.w = max(-state.max_speed, min(state.max_speed, state.w - state.step))
+                elif c == ' ':
+                    state.v = state.w = 0
+                elif c == '[':
+                    state.step = max(10, state.step - 50)
+                elif c == ']':
+                    state.step = min(1000, state.step + 50)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
+# ---- Arm teleop ----------------------------------------------------------
 
 @dataclass
 class ArmPair:
@@ -145,7 +241,7 @@ class ArmPair:
     ids: list
 
 
-def teleop_loop(pairs, rate_hz, stop):
+def teleop_loop(pairs, rate_hz, stop, wheel_bus=None, wheel_state=None):
     period = 1.0 / rate_hz
     last_warn = 0.0
     loop = 0
@@ -164,10 +260,22 @@ def teleop_loop(pairs, rate_hz, stop):
             except Exception as e:
                 print(f"[{pair.name}] loop error: {e}", flush=True)
 
+        if wheel_bus is not None and wheel_state is not None:
+            try:
+                v, w, _ = wheel_state.snapshot()
+                write_wheel_speeds(wheel_bus, v, w)
+            except Exception as e:
+                print(f"[wheels] write error: {e}", flush=True)
+
         loop += 1
         if loop % (int(rate_hz) * 2) == 0:
             dt = time.monotonic() - t0
-            print(f"[teleop] tick {loop}  last cycle {dt*1000:.1f}ms", flush=True)
+            extra = ""
+            if wheel_state is not None:
+                v, w, step = wheel_state.snapshot()
+                extra = f"  wheels v={v:+5d} w={w:+5d} step={step}"
+            print(f"[teleop] tick {loop}  last cycle {dt*1000:.1f}ms{extra}",
+                  flush=True)
 
         sleep_for = period - (time.monotonic() - t0)
         if sleep_for > 0:
@@ -191,6 +299,12 @@ def main():
                         help="Servo IDs comma-separated (default 1-6)")
     parser.add_argument("--no-confirm", action="store_true",
                         help="Skip the 'press Enter to start' safety prompt")
+    parser.add_argument("--no-wheels", action="store_true",
+                        help="Skip wheel keyboard control even if left-arm bus is open")
+    parser.add_argument("--wheels-id", default=None,
+                        help="Override iroh ID for wheels bus. If equal to the "
+                             "left-arm follower ID (combined Waveshare), the "
+                             "wheel writes share that connection.")
     args = parser.parse_args()
 
     cfg = {}
@@ -274,16 +388,64 @@ def main():
     for p in pairs:
         p.follower.set_torque(p.ids, True)
 
+    # ---- Wheels: only if left-arm is in scope and not opted out --------------
+    wheel_bus = None
+    wheel_state = None
+    own_wheel_bus = False  # True if we opened a separate xoq connection
+    left_pair = next((p for p in pairs if p.name == "left-arm"), None)
+
+    if left_pair is not None and not args.no_wheels:
+        left_arm_id = next(fid for n, _, fid in plan if n == "left-arm")
+        wheels_id = (
+            args.wheels_id
+            or (cfg.get("wheels", {}).get("id"))
+            or DEFAULT_WHEELS_ID
+        )
+        if wheels_id == left_arm_id:
+            print(f"[wheels] sharing left-arm bus  (combined Waveshare)", flush=True)
+            wheel_bus = left_pair.follower
+        else:
+            print(f"[wheels] opening separate xoq bus: {wheels_id[:16]}…", flush=True)
+            wheel_bus = FeetechBus(open_remote_bus(wheels_id), label="wheels")
+            own_wheel_bus = True
+
+        ok = [sid for sid in (WHEEL_LEFT_ID, WHEEL_RIGHT_ID) if wheel_bus.ping(sid)]
+        if len(ok) == 2:
+            print(f"[wheels] ping IDs {ok} OK", flush=True)
+            configure_wheels(wheel_bus)
+            wheel_state = WheelState()
+        else:
+            print(f"[wheels] ping found only {ok} — disabling wheel control",
+                  flush=True)
+            if own_wheel_bus:
+                wheel_bus.close()
+            wheel_bus = None
+            wheel_state = None
+            own_wheel_bus = False
+
     stop = threading.Event()
     signal.signal(signal.SIGINT, lambda *_: stop.set())
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
 
+    if wheel_state is not None:
+        kb_thread = threading.Thread(
+            target=keyboard_thread, args=(wheel_state, stop), daemon=True
+        )
+        kb_thread.start()
+
     print(f"\nTeleop active @ {args.rate_hz:.0f}Hz. Ctrl-C to stop.\n", flush=True)
     try:
-        teleop_loop(pairs, args.rate_hz, stop)
+        teleop_loop(pairs, args.rate_hz, stop,
+                    wheel_bus=wheel_bus, wheel_state=wheel_state)
     finally:
-        print("\nShutting down: disabling follower torque, closing ports...",
-              flush=True)
+        print("\nShutting down: stopping wheels, disabling follower torque, "
+              "closing ports...", flush=True)
+        if wheel_bus is not None:
+            try:
+                write_wheel_speeds(wheel_bus, 0, 0)
+                wheel_bus.set_torque((WHEEL_LEFT_ID, WHEEL_RIGHT_ID), False)
+            except Exception as e:
+                print(f"[wheels] stop/torque-off failed: {e}", flush=True)
         for p in pairs:
             try:
                 p.follower.set_torque(p.ids, False)
@@ -291,6 +453,8 @@ def main():
                 print(f"[{p.name}] follower torque-off failed: {e}", flush=True)
             p.leader.close()
             p.follower.close()
+        if own_wheel_bus and wheel_bus is not None:
+            wheel_bus.close()
 
     return 0
 

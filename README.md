@@ -61,15 +61,33 @@ plain pyserial code in the same env.
 uv run python xoq_servers.py
 ```
 
-By default it auto-detects which `/dev/tty.usbmodem*` is which: a port whose
-servos respond to Feetech IDs **7 and 8** is the wheels bus, ports responding
-to ID **1** are arms (lowest path → left). Override any slot by passing
-`--left-arm-port`, `--right-arm-port`, or `--wheels-port`.
+By default it auto-detects which `/dev/tty.usbmodem*` is which:
+- A port responding to Feetech IDs **1 + 7 + 8** is the **combined Waveshare**
+  (one arm sharing a bus with the diff-drive base). It takes the `left-arm`
+  slot and the `wheels` entry in `xoq_config.json` is aliased to it.
+- A port responding to **7 + 8** only is wheels-only (legacy 3-bus layout).
+- A port responding to **1** only is an arm-only bus.
 
-First run builds `serial-server --features "iroh serial"` (~30s). After all 3
-buses log a `Server ID:` line, the script writes `xoq_config.json` next to
-itself. iroh identities are persisted under `~/.xoq/xlerobot/<name>/` so the
-3 IDs are stable across restarts — you only copy the config file once.
+Override any slot by passing `--left-arm-port`, `--right-arm-port`, or
+`--wheels-port`.
+
+First run builds `serial-server --features "iroh serial"` (~30s). After every
+unique bus logs `Server ID:`, the script writes `xoq_config.json` next to
+itself. With a combined bus you'll see 2 server IDs and 3 config entries
+(`wheels.alias_of = "left-arm"`). iroh identities are persisted under
+`~/.xoq/xlerobot/<name>/` so the IDs are stable across restarts — you only
+copy the config file once.
+
+### Recommended: 2-bus combined layout
+
+The simplest physical setup uses two Waveshare Bus Servo Adapters:
+- **Adapter A** (`left-arm` slot): left arm IDs 1-6 + wheels IDs 7,8 — both
+  daisy-chained off the same adapter's two parallel servo jacks.
+- **Adapter B** (`right-arm` slot): right arm IDs 1-6.
+
+This halves the USB+power-supply count vs the 3-bus layout. Make sure the
+power supply on adapter A can sustain peak current for an arm + 2 wheels
+together (≥7 A continuous recommended).
 
 ## Operator side — drive the wheels
 
@@ -79,7 +97,7 @@ uv run python wheel_client.py
 # w/s = forward/reverse | a/d = turn | space = stop | [/] = step | q = quit
 ```
 
-## Operator side — teleop the arms
+## Operator side — teleop the arms (and drive the wheels at the same time)
 
 Plug both leader SO-100 arms into the operator machine, then:
 
@@ -94,6 +112,16 @@ uv run python teleop_client.py \
 Safety sequence on startup: torque off everything → seed each follower's goal
 to its leader's current pose → wait for Enter → torque on followers → loop.
 Ctrl-C disables follower torque.
+
+If `left-arm` is in scope and the wheels bus aliases to it (combined layout),
+the same script also drives the wheels via keyboard — no separate terminal:
+```
+[wheels] w/s = forward/reverse | a/d = turn left/right
+         space = stop | [/] = step | q = quit
+```
+Pass `--no-wheels` to disable, or `--wheels-id <hex>` to point wheels at a
+different XoQ server (legacy 3-bus layout). `wheel_client.py` still works as
+a standalone wheel-only driver.
 
 ## Hardware notes
 
