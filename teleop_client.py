@@ -48,6 +48,14 @@ DEFAULT_SERVO_IDS = [1, 2, 3, 4, 5, 6]
 DEFAULT_BAUD = 1_000_000
 DEFAULT_CONFIG = Path(__file__).resolve().parent / "xoq_config.json"
 
+# Default follower iroh IDs — point at the public xlerobot demo arms. If you
+# run your own xoq_servers.py the generated xoq_config.json takes precedence,
+# and --left-arm-id / --right-arm-id always win.
+DEFAULT_FOLLOWER_IDS = {
+    "left-arm":  "bbe73cf93555520472aeb48ebe62677099887e9b64ef53590740d0c78e7c5060",
+    "right-arm": "02d5f49e541f0777eca479d240babf8d0f9f33b81d49c13d7c3a77a06af2afad",
+}
+
 
 def _checksum(body):
     return (~sum(body)) & 0xFF
@@ -172,6 +180,10 @@ def main():
                         help="xoq_config.json written by xoq_servers.py")
     parser.add_argument("--leader-left-port", default=None)
     parser.add_argument("--leader-right-port", default=None)
+    parser.add_argument("--left-arm-id", default=None,
+                        help="Override follower iroh ID for left arm")
+    parser.add_argument("--right-arm-id", default=None,
+                        help="Override follower iroh ID for right arm")
     parser.add_argument("--side", choices=["both", "left", "right"], default="both")
     parser.add_argument("--rate-hz", type=float, default=100.0)
     parser.add_argument("--baud", type=int, default=DEFAULT_BAUD)
@@ -181,15 +193,20 @@ def main():
                         help="Skip the 'press Enter to start' safety prompt")
     args = parser.parse_args()
 
-    if not args.config.exists():
-        print(f"error: config not found: {args.config}\n"
-              f"  run xoq_servers.py first to create it.", file=sys.stderr)
-        return 2
-    cfg = json.loads(args.config.read_text())["servers"]
-    for k in ("left-arm", "right-arm"):
-        if k not in cfg:
-            print(f"error: config missing '{k}' entry", file=sys.stderr)
-            return 2
+    cfg = {}
+    if args.config.exists():
+        try:
+            cfg = json.loads(args.config.read_text()).get("servers", {})
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"warning: failed to read {args.config} ({e}); falling back to "
+                  f"built-in defaults", file=sys.stderr)
+
+    def resolve_follower_id(slot, override):
+        if override:
+            return override, "--*-arm-id"
+        if slot in cfg and cfg[slot].get("id"):
+            return cfg[slot]["id"], str(args.config)
+        return DEFAULT_FOLLOWER_IDS[slot], "built-in default"
 
     ids = [int(x) for x in args.ids.split(",") if x.strip()]
 
@@ -198,12 +215,16 @@ def main():
         if not args.leader_left_port:
             print("error: --leader-left-port required for left side", file=sys.stderr)
             return 2
-        plan.append(("left-arm", args.leader_left_port, cfg["left-arm"]["id"]))
+        fid, src = resolve_follower_id("left-arm", args.left_arm_id)
+        print(f"[left-arm]  follower ID source: {src}")
+        plan.append(("left-arm", args.leader_left_port, fid))
     if args.side in ("both", "right"):
         if not args.leader_right_port:
             print("error: --leader-right-port required for right side", file=sys.stderr)
             return 2
-        plan.append(("right-arm", args.leader_right_port, cfg["right-arm"]["id"]))
+        fid, src = resolve_follower_id("right-arm", args.right_arm_id)
+        print(f"[right-arm] follower ID source: {src}")
+        plan.append(("right-arm", args.leader_right_port, fid))
 
     pairs = []
     for name, leader_port, follower_id in plan:
