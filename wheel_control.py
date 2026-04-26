@@ -112,9 +112,11 @@ class WheelMotor:
 
 
 class DiffDrive:
-    def __init__(self, port, left_id=LEFT_ID, right_id=RIGHT_ID,
-                 baudrate=BAUDRATE, invert_right=True):
-        self.ser = serial.Serial(port, baudrate=baudrate, timeout=0.05)
+    def __init__(self, ser, left_id=LEFT_ID, right_id=RIGHT_ID, invert_right=True):
+        # `ser` is a pre-opened serial port (pyserial OR xoq.serial.Serial) — the
+        # caller decides the transport so we don't depend on serial.Serial being
+        # monkey-patched.
+        self.ser = ser
         self.left = WheelMotor(self.ser, left_id)
         self.right = WheelMotor(self.ser, right_id)
         self.invert_right = invert_right
@@ -227,8 +229,9 @@ def main():
                         help="RAM Torque Limit (0-1000, runtime cap)")
     args = parser.parse_args()
 
+    ser = serial.Serial(args.port, baudrate=BAUDRATE, timeout=0.05)
     drive = DiffDrive(
-        args.port,
+        ser,
         left_id=args.left_id,
         right_id=args.right_id,
         invert_right=not args.no_invert_right,

@@ -1,0 +1,27 @@
+[project]
+name = "xlerobot"
+version = "0.1.0"
+description = "Dual SO-100 + diff-drive teleop over XoQ (iroh P2P serial bridges)."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+dependencies = [
+    # `xoq` umbrella exposes xoq.serial (lazy → xoq_serial). We use
+    # xoq.serial.Serial(<iroh-id>) explicitly for remote ports rather than
+    # relying on the import-`serial` monkey-patch.
+    "xoq",
+    "xoq-serial",
+    # Used directly for local leader arms and autodetect probing.
+    "pyserial>=3.5",
+]
+
+# This project is a collection of top-level scripts, not a buildable package.
+# Telling uv so skips the "no build-system" packaging error during `uv sync`.
+[tool.uv]
+package = false
+
+# Build xoq-serial from the sibling wser checkout. Assumes ../wser is present;
+# if it isn't, `uv sync` will fail with a clear path-not-found error.
+[tool.uv.sources]
+xoq        = { path = "../wser/packages/xoq",    editable = true }
+xoq-serial = { path = "../wser/packages/serial", editable = true }

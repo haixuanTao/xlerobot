@@ -17,28 +17,17 @@ import json
 import sys
 from pathlib import Path
 
-# Install the xoq_serial hook BEFORE wheel_control imports `serial`, so
-# 64-hex iroh IDs are routed remotely instead of being treated as /dev paths.
 try:
-    from xoq_serial import _serial_hook as _xoq_hook
-    _xoq_hook.install()
+    import xoq
 except ImportError:
     print(
-        "error: this script needs `xoq_serial` to route remote serial ports.\n"
-        "  fix: run with the wser venv that already has it:\n"
-        f"    /Users/xaviertao/Documents/work/wser/.venv/bin/python {sys.argv[0]}\n"
-        "  or install it: pip install -e /Users/xaviertao/Documents/work/wser/packages/serial",
+        "error: `xoq` is required for remote serial ports.\n"
+        "  fix: run `uv sync` in this project, then `uv run python wheel_client.py ...`",
         file=sys.stderr,
     )
     sys.exit(2)
 
-from wheel_control import (
-    BAUDRATE,
-    DiffDrive,
-    LEFT_ID,
-    RIGHT_ID,
-    keyboard_loop,
-)
+from wheel_control import DiffDrive, LEFT_ID, RIGHT_ID, keyboard_loop
 
 DEFAULT_CONFIG = Path(__file__).resolve().parent / "xoq_config.json"
 
@@ -79,11 +68,11 @@ def main():
         return 2
 
     print(f"Connecting to wheels server  {wheels_id[:16]}…")
+    ser = xoq.serial.Serial(wheels_id, timeout=0.05)
     drive = DiffDrive(
-        wheels_id,                      # routed through xoq_serial hook
+        ser,
         left_id=args.left_id,
         right_id=args.right_id,
-        baudrate=BAUDRATE,
         invert_right=not args.no_invert_right,
     )
     try:

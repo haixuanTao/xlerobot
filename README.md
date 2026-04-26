@@ -31,19 +31,34 @@ robot machine                          operator machine
 
 ## Setup
 
-You need [the `wser` repo](https://github.com/haixuanTao/wser) checked out and
-its Python environment available on both machines (provides the `serial-server`
-binary and the `xoq_serial` import hook).
+Clone [`wser`](https://github.com/haixuanTao/wser) as a sibling of this repo
+(it provides the `serial-server` binary plus the `xoq` / `xoq-serial` Python
+packages we depend on by path):
 
 ```
-# wser venv with xoq_serial installed
-WSER_PY=/path/to/wser/.venv/bin/python
+~/Documents/work/
+├── wser        # https://github.com/haixuanTao/wser
+└── xlerobot    # this repo
 ```
+
+Then create the environment with [uv](https://docs.astral.sh/uv/):
+
+```
+uv sync
+```
+
+This builds `xoq-serial` from `../wser/packages/serial` via maturin (~1m on a
+clean slate) and installs `xoq`, `xoq-serial`, `pyserial` into `.venv/`. After
+that, run any of the scripts with `uv run python <script>.py …`.
+
+The remote-port path uses `xoq.serial.Serial(<iroh-id>)` explicitly — we don't
+rely on the `import serial` monkey-patch, so the scripts coexist cleanly with
+plain pyserial code in the same env.
 
 ## Robot side — start the servers
 
 ```
-$WSER_PY xoq_servers.py
+uv run python xoq_servers.py
 ```
 
 By default it auto-detects which `/dev/tty.usbmodem*` is which: a port whose
@@ -60,7 +75,7 @@ itself. iroh identities are persisted under `~/.xoq/xlerobot/<name>/` so the
 
 ```
 scp robot:.../xlerobot/xoq_config.json ./
-$WSER_PY wheel_client.py
+uv run python wheel_client.py
 # w/s = forward/reverse | a/d = turn | space = stop | [/] = step | q = quit
 ```
 
@@ -69,7 +84,7 @@ $WSER_PY wheel_client.py
 Plug both leader SO-100 arms into the operator machine, then:
 
 ```
-$WSER_PY teleop_client.py \
+uv run python teleop_client.py \
   --leader-left-port  /dev/tty.usbmodem-LEADER-L \
   --leader-right-port /dev/tty.usbmodem-LEADER-R
 # add --side left or --side right to teleop one arm

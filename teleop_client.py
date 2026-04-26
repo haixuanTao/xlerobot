@@ -22,22 +22,17 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-# Install the xoq_serial hook BEFORE `import serial`, so 64-hex iroh IDs
-# route over the network instead of being treated as /dev paths.
+import serial as pyserial  # only for local /dev/tty.* leader arms
+
 try:
-    from xoq_serial import _serial_hook as _xoq_hook
-    _xoq_hook.install()
+    import xoq  # for remote follower arms (xoq.serial.Serial)
 except ImportError:
     print(
-        "error: this script needs `xoq_serial` to route remote serial ports.\n"
-        "  fix: run with the wser venv that already has it:\n"
-        f"    /Users/xaviertao/Documents/work/wser/.venv/bin/python {sys.argv[0]}\n"
-        "  or install it: pip install -e /Users/xaviertao/Documents/work/wser/packages/serial",
+        "error: `xoq` is required for remote serial ports.\n"
+        "  fix: run `uv sync` in this project, then `uv run python teleop_client.py ...`",
         file=sys.stderr,
     )
     sys.exit(2)
-
-import serial  # patched by xoq_serial: 64-hex IDs route over iroh
 
 # --- Feetech STS3215 (protocol v1) ---------------------------------------
 INST_PING = 0x01
@@ -75,11 +70,19 @@ def _sync_write_packet(addr, data_len, items):
     return bytes([0xFF, 0xFF, *body, _checksum(body)])
 
 
-class FeetechBus:
-    """Minimal STS3215 v1 driver. Works on real or xoq remote serial ports."""
+def open_local_bus(path, baudrate=DEFAULT_BAUD, timeout=0.05):
+    return pyserial.Serial(path, baudrate=baudrate, timeout=timeout)
 
-    def __init__(self, port_id, baudrate=DEFAULT_BAUD, timeout=0.05, label=""):
-        self.ser = serial.Serial(port_id, baudrate=baudrate, timeout=timeout)
+
+def open_remote_bus(node_id, timeout=0.05):
+    return xoq.serial.Serial(node_id, timeout=timeout)
+
+
+class FeetechBus:
+    """Minimal STS3215 v1 driver over a pre-opened serial port (any transport)."""
+
+    def __init__(self, ser, label=""):
+        self.ser = ser
         self.label = label
 
     def close(self):
@@ -204,10 +207,16 @@ def main():
 
     pairs = []
     for name, leader_port, follower_id in plan:
-        print(f"[{name}] opening leader (local): {leader_port}", flush=True)
-        leader = FeetechBus(leader_port, baudrate=args.baud, label=f"{name}-leader")
-        print(f"[{name}] opening follower (xoq):  {follower_id[:16]}…", flush=True)
-        follower = FeetechBus(follower_id, baudrate=args.baud, label=f"{name}-follower")
+        print(f"[{name}] opening leader (pyserial): {leader_port}", flush=True)
+        leader = FeetechBus(
+            open_local_bus(leader_port, baudrate=args.baud),
+            label=f"{name}-leader",
+        )
+        print(f"[{name}] opening follower (xoq):    {follower_id[:16]}…", flush=True)
+        follower = FeetechBus(
+            open_remote_bus(follower_id),
+            label=f"{name}-follower",
+        )
         pairs.append(ArmPair(name=name, leader=leader, follower=follower, ids=ids))
 
     # Pings — useful early signal that buses are alive and IDs match.
