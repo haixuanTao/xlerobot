@@ -324,15 +324,33 @@ def main():
 
     ids = [int(x) for x in args.ids.split(",") if x.strip()]
 
+    # With --side both (default), auto-narrow to whichever side(s) actually
+    # have a leader port. Only error if neither side is available.
+    sides = []
+    if args.side == "both":
+        if args.leader_left_port:
+            sides.append("left")
+        if args.leader_right_port:
+            sides.append("right")
+        if not sides:
+            print("error: provide --leader-left-port and/or --leader-right-port",
+                  file=sys.stderr)
+            return 2
+        if len(sides) == 1:
+            print(f"[info] only {sides[0]} leader port given — running single-arm",
+                  flush=True)
+    else:
+        sides = [args.side]
+
     plan = []
-    if args.side in ("both", "left"):
+    if "left" in sides:
         if not args.leader_left_port:
             print("error: --leader-left-port required for left side", file=sys.stderr)
             return 2
         fid, src = resolve_follower_id("left-arm", args.left_arm_id)
         print(f"[left-arm]  follower ID source: {src}")
         plan.append(("left-arm", args.leader_left_port, fid))
-    if args.side in ("both", "right"):
+    if "right" in sides:
         if not args.leader_right_port:
             print("error: --leader-right-port required for right side", file=sys.stderr)
             return 2
